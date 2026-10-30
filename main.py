@@ -4,7 +4,7 @@ from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
 from weasyprint import HTML
 from docx import Document
 from bs4 import BeautifulSoup
@@ -15,8 +15,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY environment variable is not set")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
 app = FastAPI(title="Lesson Note AI Backend")
 
@@ -84,10 +84,15 @@ def generate_lesson_html(req: LessonNoteRequest) -> str:
         evaluation=", ".join(req.evaluation_guide)
     )
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt
+        )
         html_content = response.text.strip()
         if html_content.startswith("```html"):
             html_content = html_content[7:]
+        if html_content.startswith("```"):
+            html_content = html_content[3:]
         if html_content.endswith("```"):
             html_content = html_content[:-3]
         return html_content.strip()
@@ -155,11 +160,11 @@ def html_to_pdf(html_str: str, title: str) -> bytes:
 # ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"status": "alive", "service": "Lesson Note AI"}
+    return {"status": "alive", "service": "Lesson Note AI", "model": MODEL_NAME}
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model": "gemini-1.5-flash"}
+    return {"status": "healthy", "model": MODEL_NAME}
 
 @app.post("/generate-lesson-note")
 def generate_lesson_note(req: LessonNoteRequest):
