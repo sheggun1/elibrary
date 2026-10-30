@@ -7,13 +7,14 @@ from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime,
-    ForeignKey, select, delete
+    ForeignKey, select
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from google import genai
+from google.genai import types as genai_types
 from weasyprint import HTML
 from docx import Document
 from bs4 import BeautifulSoup
@@ -131,7 +132,7 @@ def require_admin(x_admin_key: Optional[str] = Header(None)):
     return True
 
 
-# ---------- Prompt (same as before) ----------
+# ---------- Lesson Note Prompt ----------
 PROMPT_TEMPLATE = """
 You are an expert Nigerian teacher. Generate a complete NERDC-compliant LESSON NOTE.
 
@@ -216,7 +217,14 @@ def generate_lesson_html(req: LessonNoteRequest) -> str:
     base_delay = 1.0
     for attempt in range(max_retries + 1):
         try:
-            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    max_output_tokens=16384,
+                    temperature=0.7,
+                ),
+            )
             html_content = response.text.strip()
             if html_content.startswith("```html"):
                 html_content = html_content[7:]
@@ -277,6 +285,7 @@ def html_to_docx(html_str: str, title: str) -> bytes:
     return buf.getvalue()
 
 
+# ---------- HTML -> PDF ----------
 def html_to_pdf(html_str: str, title: str) -> bytes:
     full_html = f"""
     <!DOCTYPE html>
@@ -361,7 +370,7 @@ def seed_if_empty():
 
 @app.get("/")
 def root():
-    return {"status": "alive", "service": "Lesson Note AI", "model": MODEL_NAME, "version": "step3"}
+    return {"status": "alive", "service": "Lesson Note AI", "model": MODEL_NAME, "version": "step3.1"}
 
 
 @app.get("/health")
@@ -372,7 +381,7 @@ def health():
 # ---------- Admin endpoints ----------
 @app.post("/admin/curriculum/json")
 def admin_save_json(payload: CurriculumInput, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    cur = Curriculum(class_level=payload.class_level, subject=payload.subject, term=payload.term)
+    cur = Curriculum(class_level=payload.class_level, subject=payload.subject, term=payload.term or "First Term")
     db.add(cur)
     db.flush()
     for w in payload.weeks:
@@ -408,15 +417,18 @@ async def admin_extract_pdf(
     if len(text.strip()) < 200:
         raise HTTPException(status_code=400, detail="Extracted text too short — is this a scanned PDF?")
 
+    # Trim to ~200k chars to stay well inside Gemini's context window
+    source_text = text[:200000]
+
     extraction_prompt = f"""
 You are a curriculum parser for Nigerian NERDC documents.
 
-Extract ALL weekly curriculum entries from the text below into STRICT JSON.
+Extract ALL weekly curriculum entries from the source text below into STRICT JSON.
 
 Return ONLY valid JSON matching this schema, no other text:
 {{
-  "class_level": "e.g. JSS 1 / SSS 2",
-  "subject": "e.g. Mathematics",
+  "class_level": "e.g. JSS 1 / SSS 1 / SSS 2",
+  "subject": "e.g. Mathematics / English Language",
   "term": "First Term",
   "weeks": [
     {{
@@ -432,18 +444,28 @@ Return ONLY valid JSON matching this schema, no other text:
   ]
 }}
 
-Rules:
-- If a field is not present in the source text, use an empty array [].
-- Do NOT invent content.
+CRITICAL RULES:
+- Extract EVERY week/topic in the document. Do not stop early.
+- If the document contains 12 weeks, return 12 weeks. If 19, return 19.
+- If a field is missing for a week, use []. Do NOT leave a sentence or list item unfinished.
+- Do NOT truncate. Keep going until the entire document has been processed.
 - Preserve the Nigerian curriculum wording where possible.
-- Output pure JSON only (no markdown fences).
+- If term is not stated, default to "First Term".
+- Output pure JSON only (no markdown fences, no explanations).
 
 === SOURCE TEXT ===
-{text[:25000]}
+{source_text}
 """
 
     try:
-        resp = client.models.generate_content(model=MODEL_NAME, contents=extraction_prompt)
+        resp = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=extraction_prompt,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=32768,
+                temperature=0.1,
+            ),
+        )
         raw_out = resp.text.strip()
         if raw_out.startswith("```json"):
             raw_out = raw_out[7:]
@@ -454,13 +476,15 @@ Rules:
         raw_out = raw_out.strip()
         parsed = json.loads(raw_out)
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {e}. Raw: {raw_out[:500]}")
+        raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {e}. First 500 chars: {raw_out[:500]}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI extraction failed: {e}")
 
+    weeks = parsed.get("weeks", [])
     return {
         "ok": True,
-        "message": "Review the extracted data. If correct, POST it to /admin/curriculum/json with X-Admin-Key.",
+        "weeks_extracted": len(weeks),
+        "message": "Review. If correct, POST /admin/curriculum/json with X-Admin-Key.",
         "extracted": parsed
     }
 
