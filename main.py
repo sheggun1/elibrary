@@ -32,13 +32,13 @@ import uvicorn
 
 # ---------- Config ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me-later")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
 SCHOOL_NAME = os.getenv("SCHOOL_NAME", "").strip()
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "40"))
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-if ADMIN_KEY == "change-me-later":
-    print("WARNING: ADMIN_KEY is the default value. Set a strong ADMIN_KEY environment variable.")
+if not ADMIN_KEY:
+    print("WARNING: ADMIN_KEY is not set. Admin sign-in is disabled until you set it.")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.8-flash")
@@ -55,6 +55,7 @@ STATIC_DIR = BASE_DIR / "static"
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    pool_recycle=300,  # serverless Postgres (Neon) closes idle connections
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -91,7 +92,12 @@ class Week(Base):
     curriculum = relationship("Curriculum", back_populates="weeks")
 
 
-Base.metadata.create_all(bind=engine)
+DB_STARTUP_ERROR = None
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as _e:  # keep the site up so /api/status can say what is wrong
+    DB_STARTUP_ERROR = f"{type(_e).__name__}: {str(_e).splitlines()[0][:200]}"
+    print("DATABASE ERROR:", DB_STARTUP_ERROR)
 
 
 def get_db():
@@ -187,10 +193,15 @@ class ExportRequest(BaseModel):
 
 # ---------- Auth / rate limiting ----------
 def _is_admin_key(key: Optional[str]) -> bool:
-    return bool(key) and hmac.compare_digest(key.encode(), ADMIN_KEY.encode())
+    return bool(ADMIN_KEY) and bool(key) and hmac.compare_digest(key.strip().encode(), ADMIN_KEY.encode())
 
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
+    if not ADMIN_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ADMIN_KEY is not set on the server. Add it in Render > Environment, then redeploy.",
+        )
     if not _is_admin_key(x_admin_key):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key header")
     return True
@@ -224,6 +235,18 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+def _ai_hint(err: str) -> str:
+    low = err.lower()
+    hint = ""
+    if "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low or "403" in err:
+        hint = " -> Check GEMINI_API_KEY in Render > Environment (no spaces, key still active)."
+    elif "404" in err or "not found" in low:
+        hint = f" -> The model '{MODEL_NAME}' was not found for this key. Set a MODEL_NAME environment variable to a model your key can use."
+    elif "429" in err or "quota" in low or "resource_exhausted" in low:
+        hint = " -> Gemini quota or rate limit reached. Wait a minute or check your Google AI Studio quota."
+    return err[:400] + hint
+
+
 def call_gemini(prompt: str, *, max_tokens: int, temperature: float, json_mode: bool = False) -> str:
     cfg = dict(max_output_tokens=max_tokens, temperature=temperature)
     if json_mode:
@@ -237,6 +260,8 @@ def call_gemini(prompt: str, *, max_tokens: int, temperature: float, json_mode: 
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(**cfg),
             )
+            if not response.text:
+                raise RuntimeError("The AI returned an empty answer (it may have been blocked or cut off)")
             return _strip_fences(response.text)
         except Exception as e:
             error_str = str(e)
@@ -246,7 +271,7 @@ def call_gemini(prompt: str, *, max_tokens: int, temperature: float, json_mode: 
                 print(f"Attempt {attempt + 1} failed. Retrying in {delay:.1f}s...")
                 time.sleep(delay)
                 continue
-            raise HTTPException(status_code=500, detail=f"AI generation failed: {error_str}")
+            raise HTTPException(status_code=500, detail=f"AI generation failed: {_ai_hint(error_str)}")
     raise HTTPException(status_code=500, detail="AI generation failed: max retries exceeded")
 
 
@@ -640,6 +665,8 @@ app = FastAPI(title="Lesson Note AI Backend")
 
 @app.on_event("startup")
 def seed_if_empty():
+    if DB_STARTUP_ERROR:
+        return
     db = SessionLocal()
     try:
         count = db.execute(select(Curriculum)).scalars().first()
@@ -699,6 +726,38 @@ def root(request: Request):
 @app.get("/health")
 def health():
     return {"status": "healthy", "model": MODEL_NAME}
+
+
+@app.get("/api/status")
+def api_status():
+    """Public, secret-free health report so setup problems are visible on the site."""
+    db_ok, db_err, count = True, DB_STARTUP_ERROR, None
+    if DB_STARTUP_ERROR:
+        db_ok = False
+    else:
+        try:
+            with SessionLocal() as db:
+                count = len(db.execute(select(Curriculum.id)).scalars().all())
+        except Exception as e:
+            db_ok, db_err = False, f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
+    return {
+        "database_ok": db_ok,
+        "database_type": engine.dialect.name,
+        "database_error": db_err,
+        "curricula_count": count,
+        "admin_key_set": bool(ADMIN_KEY),
+        "model": MODEL_NAME,
+    }
+
+
+@app.post("/admin/diagnose")
+def admin_diagnose(_: bool = Depends(require_admin)):
+    """Makes one tiny AI call so the admin can see the real error, if any."""
+    try:
+        text = call_gemini("Reply with the single word OK.", max_tokens=64, temperature=0)
+        return {"ok": True, "model": MODEL_NAME, "reply": text[:50]}
+    except HTTPException as e:
+        return {"ok": False, "model": MODEL_NAME, "error": e.detail}
 
 
 # ---------- Admin: curriculum management ----------
