@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import time
 import random
@@ -43,7 +44,11 @@ if not ADMIN_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.8-flash")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./curriculum.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./curriculum.db").strip()
+# Neon's dashboard offers a "psql '...'" command; pull the URL out of it if that was pasted
+_m = re.search(r"postgres(?:ql)?://[^'\"\s]+", DATABASE_URL)
+if _m:
+    DATABASE_URL = _m.group(0)
 # Render (and Heroku) hand out postgres:// URLs; SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -52,12 +57,24 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 # ---------- Database ----------
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=300,  # serverless Postgres (Neon) closes idle connections
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-)
+DB_STARTUP_ERROR = None
+
+
+def _make_engine(url):
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_recycle=300,  # serverless Postgres (Neon) closes idle connections
+        connect_args={"check_same_thread": False} if url.startswith("sqlite") else {}
+    )
+
+
+try:
+    engine = _make_engine(DATABASE_URL)
+except Exception as _e:  # bad DATABASE_URL: stay up so the site can explain it
+    DB_STARTUP_ERROR = f"DATABASE_URL is invalid ({type(_e).__name__}: {str(_e).splitlines()[0][:150]})"
+    print("DATABASE ERROR:", DB_STARTUP_ERROR)
+    engine = _make_engine("sqlite:///:memory:")
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
@@ -92,12 +109,12 @@ class Week(Base):
     curriculum = relationship("Curriculum", back_populates="weeks")
 
 
-DB_STARTUP_ERROR = None
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as _e:  # keep the site up so /api/status can say what is wrong
-    DB_STARTUP_ERROR = f"{type(_e).__name__}: {str(_e).splitlines()[0][:200]}"
-    print("DATABASE ERROR:", DB_STARTUP_ERROR)
+if not DB_STARTUP_ERROR:
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as _e:  # keep the site up so /api/status can say what is wrong
+        DB_STARTUP_ERROR = f"{type(_e).__name__}: {str(_e).splitlines()[0][:200]}"
+        print("DATABASE ERROR:", DB_STARTUP_ERROR)
 
 
 def get_db():
