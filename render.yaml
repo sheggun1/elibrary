@@ -7,3 +7,15 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false
+      - key: ADMIN_KEY
+        generateValue: true   # Render creates a random key; read it in the dashboard > Environment
+      - key: SCHOOL_NAME
+        sync: false           # optional, printed on scheme of work and question papers
+      - key: DATABASE_URL
+        fromDatabase:
+          name: lesson-db
+          property: connectionString
+
+databases:
+  - name: lesson-db
+    plan: free
